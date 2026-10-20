@@ -1,0 +1,156 @@
+name: Publish argo-rollouts image to Dojo Creator Platform GAR
+run-name: Publish argo-rollouts ${{ inputs.version || github.ref_name }} (DCP)
+
+# Builds the controller image and pushes it to the nonprod and prod
+# Dojo Creator Platform Artifact Registries.
+on:
+  push:
+    branches:
+      - feat/dojo-release
+    tags:
+      - 'v*-dojo'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Image tag, e.g. v1.8.3-dojo (defaults to the tag/branch on push events)'
+        required: false
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions: {}
+
+env:
+  GAR_REGISTRY: europe-west2-docker.pkg.dev
+  GAR_REPO: docker
+  IMAGE_NAME: argo-rollouts
+
+jobs:
+  publish-nonprod:
+    name: Publish to nonprod GAR
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      GAR_PROJECT: dojo-creator-platform-nonprod
+    outputs:
+      version: ${{ steps.cfg.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve version
+        id: cfg
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          version="${INPUT_VERSION:-${GITHUB_REF_NAME}}"
+          # Docker tags cannot contain '/'
+          version="${version//\//-}"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      - id: auth
+        name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          project_id: ${{ env.GAR_PROJECT }}
+          workload_identity_provider: 'projects/49880795912/locations/global/workloadIdentityPools/github/providers/github-dojo-engineering'
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Login to GAR
+        run: gcloud auth configure-docker ${{ env.GAR_REGISTRY }} --quiet
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            MAKE_TARGET=controller
+          tags: |
+            ${{ env.GAR_REGISTRY }}/${{ env.GAR_PROJECT }}/${{ env.GAR_REPO }}/${{ env.IMAGE_NAME }}:${{ steps.cfg.outputs.version }}
+
+      - name: Verify image was pushed
+        run: |
+          image="${GAR_REGISTRY}/${GAR_PROJECT}/${GAR_REPO}/${IMAGE_NAME}:${{ steps.cfg.outputs.version }}"
+          docker buildx imagetools inspect "${image}" > /dev/null \
+            || { echo "::error::${image} was not pushed"; exit 1; }
+
+      - name: Summary
+        run: |
+          {
+            echo "## Published (nonprod)"
+            echo "- **Image**: ${GAR_REGISTRY}/${GAR_PROJECT}/${GAR_REPO}/${IMAGE_NAME}:${{ steps.cfg.outputs.version }}"
+            echo "- **Ref**: ${GITHUB_REF_NAME} (${GITHUB_SHA})"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  publish-prod:
+    name: Publish to prod GAR
+    needs: publish-nonprod
+    # Prod access requires the workflow to run from main/master or a tag ref.
+    if: ${{ github.ref_type == 'tag' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      GAR_PROJECT: dojo-creator-platform-prod
+      VERSION: ${{ needs.publish-nonprod.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - id: auth
+        name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          project_id: ${{ env.GAR_PROJECT }}
+          workload_identity_provider: 'projects/202461958668/locations/global/workloadIdentityPools/github/providers/github-dojo-engineering'
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Login to GAR
+        run: gcloud auth configure-docker ${{ env.GAR_REGISTRY }} --quiet
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            MAKE_TARGET=controller
+          tags: |
+            ${{ env.GAR_REGISTRY }}/${{ env.GAR_PROJECT }}/${{ env.GAR_REPO }}/${{ env.IMAGE_NAME }}:${{ env.VERSION }}
+
+      - name: Verify image was pushed
+        run: |
+          image="${GAR_REGISTRY}/${GAR_PROJECT}/${GAR_REPO}/${IMAGE_NAME}:${VERSION}"
+          docker buildx imagetools inspect "${image}" > /dev/null \
+            || { echo "::error::${image} was not pushed"; exit 1; }
+
+      - name: Summary
+        run: |
+          {
+            echo "## Published (prod)"
+            echo "- **Image**: ${GAR_REGISTRY}/${GAR_PROJECT}/${GAR_REPO}/${IMAGE_NAME}:${VERSION}"
+            echo "- **Ref**: ${GITHUB_REF_NAME} (${GITHUB_SHA})"
+          } >> "$GITHUB_STEP_SUMMARY"
